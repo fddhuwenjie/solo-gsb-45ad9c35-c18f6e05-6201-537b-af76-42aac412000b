@@ -9,7 +9,9 @@
 
 门线穿越核算：在围栏有效区域内定义定向 GeoJSON LineString 门线，按设备
 时间重排轨迹，只承认线段对门线的单点横穿（proper crossing），穿越时刻按
-交点在线段上的时间比例插值。
+交点在线段上的时间比例插值。门线含三个及以上折点时，在整条门线层面归并
+共享内部折点：轨迹恰好穿过折点且折点两侧邻接段分居轨迹两侧时按一次横穿
+核算，邻接段同侧时按擦碰忽略。
 """
 from __future__ import annotations
 
@@ -27,8 +29,9 @@ EVENT_STAY = "stay"
 DIRECTION_FORWARD = "forward"    # 由门线右侧穿到左侧（沿门线坐标顺序看）
 DIRECTION_REVERSE = "reverse"    # 由门线左侧穿到右侧
 
-# 交点参数严格位于 (0, 1) 内的容差（米制投影坐标下）
-_CROSS_EPS = 1e-9
+# 交点与线段端点重合判定的绝对几何容差（米制投影坐标下）。
+# 用距离而非参数比例，避免折点恰好命中时浮点误差让两侧邻接段给出不一致的分类。
+_CROSS_EPS_M = 1e-7
 
 
 def _project(lat: float, lon: float, lat0: float, lon0: float) -> tuple[float, float]:
@@ -273,55 +276,169 @@ class GateLine:
         """求轨迹线段 a->b 对门线的单点横穿。
 
         返回 (交点在线段 a->b 上的比例 t, 方向, 交点米制坐标)；
-        不构成横穿时返回 None。以下情况一律忽略：
-        - 沿线（与某门线段共线/重合/重叠）；
-        - 仅接触门线端点或门线折点（交点不在两条线段的严格内部）；
-        - 两端在门线同一侧（同侧擦碰）；
-        - 同一轨迹线段与门线产生多于一个交点（门线仅 simple，理论上不出现，防御处理）。
+        不构成横穿时返回 None。
+
+        检测在整条门线层面进行，逐段分类后再归并共享顶点：
+        - 严格内部横穿（交点严格位于门线段与轨迹段内部）；
+        - 内部折点穿过：轨迹恰好经过门线的内部折点（折点严格位于轨迹段
+          内部），其两侧邻接门线段对该折点各报一次端点命中。折点两侧邻接
+          段分居轨迹两侧（方向判断一致）时归并为一次横穿；位于轨迹同侧时
+          按擦碰忽略，与任一侧共线（沿线）同样忽略。
+        - 首尾端点穿过、轨迹端点止于门线、沿线（共线/重合/重叠）、轨迹与
+          门线产生多个交点（多交点歧义）一律返回 None。
         """
-        hits: list[tuple[float, str, tuple[float, float]]] = []
-        for p, q in zip(self.coords, self.coords[1:]):
-            hit = _segment_proper_crossing(p, q, a, b)
+        # 分类结果：
+        #   ("proper", t, 方向, 交点)  门线段严格内部横穿
+        #   ("vertex", 折点下标, t)    门线段在其端点（折点）处命中轨迹内部
+        hits: list[tuple] = []
+        for idx, (p, q) in enumerate(zip(self.coords, self.coords[1:])):
+            kind, *payload = _segment_classify(p, q, a, b)
+            if kind == "collinear":
+                return None  # 沿线（共线/重合/重叠）
+            if kind == "proper":
+                hits.append(("proper", *payload))
+            elif kind == "vertex":
+                # 端点 q（下标 idx+1）或 p（下标 idx）命中
+                vidx = idx + 1 if payload[0] == "q" else idx
+                hits.append(("vertex", vidx))
+
+        # 归并内部折点：同一折点被两侧邻接段各报一次，在折点层面整体判定
+        vertex_hits: dict[int, int] = {}
+        merged: list[tuple[float, str, tuple[float, float]]] = []
+        for kind, *payload in hits:
+            if kind == "proper":
+                merged.append(payload)  # type: ignore[arg-type]
+                continue
+            vidx = payload[0]  # type: ignore[misc]
+            if vidx == 0 or vidx == len(self.coords) - 1:
+                continue  # 仅接触门线首尾端点
+            vertex_hits[vidx] = vertex_hits.get(vidx, 0) + 1
+
+        sx, sy = b[0] - a[0], b[1] - a[1]
+        for vidx, count in vertex_hits.items():
+            if count != 2:
+                continue  # 仅一侧邻接段命中（另一侧不相交/共线/被排除）：不算横穿
+            hit = self._vertex_crossing(vidx, a, (sx, sy))
             if hit is not None:
-                hits.append(hit)
-        if len(hits) != 1:
+                merged.append(hit)
+
+        if len(merged) != 1:
+            return None  # 多交点歧义，或没有横穿
+        return merged[0]
+
+    def _vertex_crossing(
+        self,
+        vidx: int,
+        a: tuple[float, float],
+        s: tuple[float, float],
+    ) -> tuple[float, str, tuple[float, float]] | None:
+        """判定轨迹穿过内部折点 coords[vidx] 是否构成一次横穿。
+
+        要求折点两侧邻接门线段分居轨迹两侧，且两侧给出的方向判断一致。
+        s 为轨迹位移向量；折点在轨迹段 a->b 上的参数比例由折点坐标直接求得。
+        """
+        v = self.coords[vidx]
+        sx, sy = s
+        slen = math.hypot(sx, sy)
+        if slen == 0.0:
             return None
-        return hits[0]
+        # 折点到轨迹起点沿位移方向的参数比例（取位移主轴计算，几何容差判端点）
+        if abs(sx) >= abs(sy):
+            t = (v[0] - a[0]) / sx
+            margin = _CROSS_EPS_M / slen
+        else:
+            t = (v[1] - a[1]) / sy
+            margin = _CROSS_EPS_M / slen
+        if not (margin < t < 1.0 - margin):
+            return None  # 折点落在轨迹端点（或延长线）上
+
+        # 两侧邻接臂（自折点指向相邻折点）到轨迹 a->b 的带符号距离：
+        # cross(arm, s)/|s|，> 0 在轨迹左侧，< 0 在右侧。
+        arm_prev = (self.coords[vidx - 1][0] - v[0], self.coords[vidx - 1][1] - v[1])
+        arm_next = (self.coords[vidx + 1][0] - v[0], self.coords[vidx + 1][1] - v[1])
+        d_prev = (arm_prev[0] * sy - arm_prev[1] * sx) / slen
+        d_next = (arm_next[0] * sy - arm_next[1] * sx) / slen
+        if abs(d_prev) <= _CROSS_EPS_M or abs(d_next) <= _CROSS_EPS_M:
+            return None  # 邻接臂与轨迹共线：沿线
+        if d_prev * d_next > 0.0:
+            return None  # 同侧擦碰
+
+        # 轨迹起点到两侧定向门线段支撑线的带符号距离（方向按坐标顺序）
+        r_prev = (-arm_prev[0], -arm_prev[1])
+        r_next = arm_next
+        qpx, qpy = a[0] - v[0], a[1] - v[1]
+        da_prev = (qpx * r_prev[1] - qpy * r_prev[0]) / math.hypot(*r_prev)
+        da_next = (qpx * r_next[1] - qpy * r_next[0]) / math.hypot(*r_next)
+        if abs(da_prev) <= _CROSS_EPS_M or abs(da_next) <= _CROSS_EPS_M:
+            return None  # 轨迹端点落在邻接门线段（含其延长线共线）上：沿线/歧义
+        if (da_prev > 0) != (da_next > 0):
+            return None  # 两侧方向判断不一致：多交点歧义，防御处理
+
+        direction = DIRECTION_FORWARD if da_prev > 0 else DIRECTION_REVERSE
+        return (t, direction, v)
 
 
-def _segment_proper_crossing(
+def _segment_classify(
     p: tuple[float, float],
     q: tuple[float, float],
     a: tuple[float, float],
     b: tuple[float, float],
-) -> tuple[float, str, tuple[float, float]] | None:
-    """两线段的严格内部单点横穿（proper crossing）。
+) -> tuple:
+    """分类门线段 p->q 与轨迹段 a->b 的关系。
 
-    门线段 p->q，轨迹线段 a->b。交点必须严格位于两条线段内部
-    （即参数 u、t 都在 (0, 1)），因此共线、接触端点/折点都被排除。
+    返回：
+    - ("collinear",)                  共线且有公共点（沿线，整条门线忽略）
+    - ("none",)                       不相交
+    - ("proper", t, 方向, 交点)       交点严格位于两条线段内部的横穿
+    - ("vertex", "p"|"q", t)          门线段端点恰好落在轨迹段内部（t 严格在 (0,1) 内）
     """
     rx, ry = q[0] - p[0], q[1] - p[1]
     sx, sy = b[0] - a[0], b[1] - a[1]
     denom = rx * sy - ry * sx
     if denom == 0.0:
-        return None  # 平行或共线（沿线）
+        # 平行：仅共线且有公共点才算沿线；平行不相交无需处理
+        qpx, qpy = a[0] - p[0], a[1] - p[1]
+        if qpx * ry - qpy * rx == 0.0:
+            # 共线：沿门线方向参数 u 检查两线段投影是否重叠
+            r2 = rx * rx + ry * ry
+            u0 = (qpx * rx + qpy * ry) / r2
+            u1 = ((b[0] - p[0]) * rx + (b[1] - p[1]) * ry) / r2
+            if max(min(u0, u1), 0.0) <= min(max(u0, u1), 1.0):
+                return ("collinear",)
+        return ("none",)
     qpx, qpy = a[0] - p[0], a[1] - p[1]
     u = (qpx * sy - qpy * sx) / denom
     t = (qpx * ry - qpy * rx) / denom
-    if not (_CROSS_EPS < u < 1.0 - _CROSS_EPS and _CROSS_EPS < t < 1.0 - _CROSS_EPS):
-        return None  # 交于端点/延长线（仅接触端点）或不相交
+    # 用绝对几何容差放宽参数边界：交点恰在端点时浮点误差可能让参数略微越界
+    rlen = math.hypot(rx, ry)
+    slen = math.hypot(sx, sy)
+    um = _CROSS_EPS_M / rlen
+    tm = _CROSS_EPS_M / slen
+    if not (-um <= u <= 1.0 + um and -tm <= t <= 1.0 + tm):
+        return ("none",)  # 交点落在延长线上
+    if not (tm < t < 1.0 - tm):
+        return ("none",)  # 轨迹端点止于门线：端点接触，整条门线不据此横穿
 
-    # 两端相对定向门线 p->q 的侧别（标准右手系）：
-    # cross(d, r) > 0 在门线右侧，< 0 在门线左侧。
-    side_a = qpx * ry - qpy * rx          # cross(A - P, r)
+    # 交点离门线段哪个端点更近；近于容差即按折点命中处理，
+    # 避免折点恰好命中时被两侧邻接段分别报成“端点”与“严格内部”
+    ix, iy = a[0] + t * sx, a[1] + t * sy
+    dp = math.hypot(ix - p[0], iy - p[1])
+    dq = math.hypot(ix - q[0], iy - q[1])
+    if dp <= _CROSS_EPS_M:
+        return ("vertex", "p", t)
+    if dq <= _CROSS_EPS_M:
+        return ("vertex", "q", t)
+
+    # 严格内部交点；两端须分居门线两侧（正常几何横穿必满足，此处防御）
+    side_a = qpx * ry - qpy * rx
     side_b = (qpx + sx) * ry - (qpy + sy) * rx
     if side_a * side_b >= 0.0:
-        return None  # 两端同侧（同侧擦碰）或端点恰在门线上
-    point = (a[0] + t * sx, a[1] + t * sy)
+        return ("none",)  # 同侧擦碰或端点恰在门线上
 
     # 沿门线坐标顺序看：右 -> 左为正向，左 -> 右为反向
     direction = DIRECTION_FORWARD if side_a > 0 else DIRECTION_REVERSE
-    return (t, direction, point)
+    point = (a[0] + t * sx, a[1] + t * sy)
+    return ("proper", t, direction, point)
 
 
 @dataclass
@@ -342,7 +459,8 @@ def compute_crossings(
     """对单个设备在某围栏内的门线集合计算穿越记录。
 
     points 必须已按 ts 升序排列。对每对相邻点形成的轨迹线段逐一检测：
-    - 与门线单点横穿、两端分居两侧才承认（GateLine.crossing 内判定）；
+    - 与门线单点横穿、两端分居两侧才承认（GateLine.crossing 内判定，
+      含内部折点穿过的整线归并）；
     - 相邻点位移不足门线 min_displacement_m 时忽略；
     - 穿越时刻按交点在线段上的比例在两端点时间戳间线性插值。
     同一轨迹段命中多条门线时，结果按 (插值时刻, gate_id) 排序。
