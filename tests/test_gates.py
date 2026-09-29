@@ -187,12 +187,126 @@ def test_bent_gate_segments(client):
     crossings = get_crossings(client, device_id="dev2")
     assert len(crossings) == 1 and crossings[0]["direction"] == "forward"
 
-    # 恰好穿过折点：对两段都是端点接触 -> 忽略
+    # 轨迹沿第一段方向（西->东）行进且恰好经过折点：与第一段正长度共线，
+    # 属于沿线情形；折点另一侧的南北段也只是端点接触 -> 忽略
     submit(client, [
         pt("dev3", 0, 0.004, 0.005),
         pt("dev3", 10, 0.006, 0.005),
     ])
     assert get_crossings(client, device_id="dev3") == []
+
+
+def test_crossing_through_internal_vertex_merged_once(client):
+    fid = create_fence(client)
+    # 折角门线：先西->东后南->北，内部折点 (lon=0.005,lat=0.005)
+    bent = {
+        "type": "LineString",
+        "coordinates": [[0.002, 0.005], [0.005, 0.005], [0.005, 0.008]],
+    }
+    create_gate(client, fid, bent)
+
+    # 轨迹恰在内部折点处穿过（东南 -> 西北）：折点两侧的东西段与南北段
+    # 分居轨迹两侧，方向一致（均为右->左 forward），折点位于线段中点 t=0.5
+    # -> 只归并出一次 forward（逐段严格内部判定下则为零次）
+    submit(client, [
+        pt("dev1", 0, 0.004, 0.006),
+        pt("dev1", 10, 0.006, 0.004),
+    ])
+    crossings = get_crossings(client, device_id="dev1")
+    assert len(crossings) == 1
+    c = crossings[0]
+    assert c["direction"] == "forward"
+    assert datetime.fromisoformat(c["ts"]) == ts(5)
+    assert c["lat"] == pytest.approx(0.005, abs=1e-9)
+    assert c["lon"] == pytest.approx(0.005, abs=1e-9)
+
+    # 反方向（西北 -> 东南）穿过同一折点 -> 唯一一次 reverse
+    submit(client, [
+        pt("dev2", 0, 0.006, 0.004),
+        pt("dev2", 10, 0.004, 0.006),
+    ])
+    crossings = get_crossings(client, device_id="dev2")
+    assert len(crossings) == 1 and crossings[0]["direction"] == "reverse"
+    assert datetime.fromisoformat(crossings[0]["ts"]) == ts(5)
+
+
+def test_crossing_through_vertex_ts_interpolated_by_ratio(client):
+    fid = create_fence(client)
+    bent = {
+        "type": "LineString",
+        "coordinates": [[0.002, 0.005], [0.005, 0.005], [0.005, 0.008]],
+    }
+    create_gate(client, fid, bent)
+
+    # 东南 -> 西北穿过折点，折点在线段上的参数 t=1/3：
+    # (lat .004,lon .006) -> (lat .007,lon .003)
+    submit(client, [
+        pt("dev1", 30, 0.004, 0.006),
+        pt("dev1", 60, 0.007, 0.003),
+    ])
+    crossings = get_crossings(client, device_id="dev1")
+    assert len(crossings) == 1 and crossings[0]["direction"] == "forward"
+    assert (datetime.fromisoformat(crossings[0]["ts"]) - BASE).total_seconds() == pytest.approx(
+        30 + (0.005 - 0.004) / (0.007 - 0.004) * 30
+    )
+    assert crossings[0]["lat"] == pytest.approx(0.005, abs=1e-9)
+    assert crossings[0]["lon"] == pytest.approx(0.005, abs=1e-9)
+
+
+def test_graze_vertex_same_side_ignored(client):
+    fid = create_fence(client)
+    # 门线折角朝东北（西->东 折 南->北）；轨迹沿西南 -> 东北方向穿过折点时，
+    # 两侧邻接线都在轨迹同一侧（切向擦过，微扰后为 0 或 2 个交点）-> 忽略
+    bent = {
+        "type": "LineString",
+        "coordinates": [[0.002, 0.005], [0.005, 0.005], [0.005, 0.008]],
+    }
+    create_gate(client, fid, bent)
+
+    submit(client, [
+        pt("d", 0, 0.004, 0.004),
+        pt("d", 10, 0.007, 0.007),   # 沿西南->东北擦过折点 (.005,.005)
+    ])
+    assert get_crossings(client, device_id="d") == []
+
+    # 轨迹端点恰好落在内部折点上：相邻两段都不产生 crossing
+    submit(client, [
+        pt("e", 0, 0.005, 0.005),
+        pt("e", 10, 0.007, 0.007),
+        pt("e", 20, 0.004, 0.004),
+    ])
+    assert get_crossings(client, device_id="e") == []
+
+
+def test_vertex_crossing_on_four_point_gate(client):
+    fid = create_fence(client)
+    # 含两个内部折点的门线（四个坐标点）：西->东 折 南->北 折 西->东
+    bent = {
+        "type": "LineString",
+        "coordinates": [[0.002, 0.005], [0.005, 0.005], [0.005, 0.008], [0.008, 0.008]],
+    }
+    create_gate(client, fid, bent)
+
+    # 穿过第一个内部折点 (lon=.005,lat=.005)：东南->西北 forward，t=0.5
+    submit(client, [
+        pt("dev1", 0, 0.004, 0.006),
+        pt("dev1", 10, 0.006, 0.004),
+    ])
+    crossings = get_crossings(client, device_id="dev1")
+    assert len(crossings) == 1 and crossings[0]["direction"] == "forward"
+    assert datetime.fromisoformat(crossings[0]["ts"]) == ts(5)
+
+    # 穿过第二个内部折点 (lon=.005,lat=.008)：其邻接段分别朝南、朝东，
+    # 西北->东南方向把两射线分到轨迹两侧 -> reverse
+    submit(client, [
+        pt("dev2", 0, 0.009, 0.004),
+        pt("dev2", 10, 0.007, 0.006),
+    ])
+    crossings = get_crossings(client, device_id="dev2")
+    assert len(crossings) == 1 and crossings[0]["direction"] == "reverse"
+    assert datetime.fromisoformat(crossings[0]["ts"]) == ts(5)
+    assert crossings[0]["lat"] == pytest.approx(0.008, abs=1e-9)
+    assert crossings[0]["lon"] == pytest.approx(0.005, abs=1e-9)
 
 
 def test_multiple_gates_same_segment_ordered_by_ts_then_gate_id(client):

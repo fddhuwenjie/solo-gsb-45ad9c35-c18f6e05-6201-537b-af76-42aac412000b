@@ -8,8 +8,9 @@
 把查询窗口切分为状态恒定的占用分段并标注超限明细。
 
 门线穿越核算：在围栏有效区域内定义定向 GeoJSON LineString 门线，按设备
-时间重排轨迹，只承认线段对门线的单点横穿（proper crossing），穿越时刻按
-交点在线段上的时间比例插值。
+时间重排轨迹，在整条门线层面承认轨迹对门线的单点横穿（proper crossing）；
+轨迹恰好穿过门线内部折点时，把折点两侧邻接段的端点接触归并为一次横穿，
+穿越时刻按交点在线段上的时间比例插值。
 """
 from __future__ import annotations
 
@@ -27,7 +28,7 @@ EVENT_STAY = "stay"
 DIRECTION_FORWARD = "forward"    # 由门线右侧穿到左侧（沿门线坐标顺序看）
 DIRECTION_REVERSE = "reverse"    # 由门线左侧穿到右侧
 
-# 交点参数严格位于 (0, 1) 内的容差（米制投影坐标下）
+# 交点参数严格位于 (0, 1) 内的容差（米制投影坐标下）；折点归并也用同一容差
 _CROSS_EPS = 1e-9
 
 
@@ -270,58 +271,164 @@ class GateLine:
     def crossing(
         self, a: tuple[float, float], b: tuple[float, float]
     ) -> tuple[float, str, tuple[float, float]] | None:
-        """求轨迹线段 a->b 对门线的单点横穿。
+        """求轨迹线段 a->b 对整条门线的单点横穿。
 
         返回 (交点在线段 a->b 上的比例 t, 方向, 交点米制坐标)；
         不构成横穿时返回 None。以下情况一律忽略：
-        - 沿线（与某门线段共线/重合/重叠）；
-        - 仅接触门线端点或门线折点（交点不在两条线段的严格内部）；
-        - 两端在门线同一侧（同侧擦碰）；
-        - 同一轨迹线段与门线产生多于一个交点（门线仅 simple，理论上不出现，防御处理）。
+        - 沿线（与某门线段共线/重合/重叠，含沿线触及折点/端点）；
+        - 仅接触门线首尾端点（轨迹起点或终点在门线上同样排除）；
+        - 两端在门线同一侧（同侧擦碰）：既包括在某一门线段内部折返，
+          也包括穿过内部折点但折点两侧邻接段位于轨迹同一侧；
+        - 同一轨迹线段与门线产生多于一个有效交点（门线仅 simple，理论上不出现，
+          防御处理）。
+
+        折点归并：轨迹恰好穿过门线内部折点时，对两侧邻接门线段而言交点都落在
+        端点上，逐段的严格内部判定会双双漏记。这里在整条门线层面把同一折点的
+        两次端点接触归并为一次横穿，条件是：折点在轨迹线段内部（t∈(0,1)）、
+        邻接门线段分居轨迹两侧、且两段给出的方向判断一致。只生成一次 crossing，
+        方向与时刻插值规则和普通横穿相同。
         """
-        hits: list[tuple[float, str, tuple[float, float]]] = []
-        for p, q in zip(self.coords, self.coords[1:]):
-            hit = _segment_proper_crossing(p, q, a, b)
-            if hit is not None:
-                hits.append(hit)
+        proper_hits: list[tuple[float, str, tuple[float, float]]] = []
+        # 内部折点（按折点坐标归并）-> 两侧邻接段在此处的接触信息：
+        # "in" 为沿坐标顺序进入折点的邻接段，"out" 为离开折点的邻接段；
+        # 值为 (该邻接段有向方向向量, 折点在轨迹线段上的参数 t, 该邻接段
+        # 按轨迹两端侧别给出的方向判断；共线单点相接时为 None)
+        vertex_touches: dict[
+            tuple[float, float],
+            dict[str, tuple[tuple[float, float], float, str | None]],
+        ] = {}
+        n_segments = len(self.coords) - 1
+
+        for idx, (p, q) in enumerate(zip(self.coords, self.coords[1:])):
+            r = (q[0] - p[0], q[1] - p[1])
+            kind, *payload = _segment_intersection(p, q, a, b)
+            if kind == "proper":
+                t, direction = payload
+                point = (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
+                proper_hits.append((t, direction, point))
+            elif kind == "along":
+                # 与门线段共线且存在正长度重叠：整条门线层面的沿线情形，
+                # 即使其他门线段另有交点也一律排除
+                return None
+            elif kind == "touch":
+                at_q, t, direction = payload
+                if at_q:
+                    vertex, side = q, "in"   # p->q 的 q 端，r 即进入折点的邻接段
+                    is_endpoint = idx == n_segments - 1
+                else:
+                    vertex, side = p, "out"  # p->q 的 p 端，r 即离开折点的邻接段
+                    is_endpoint = idx == 0
+                # 首尾端点接触一律忽略；轨迹端点落在折点上（t=0/1）同样排除
+                if not is_endpoint and _CROSS_EPS < t < 1.0 - _CROSS_EPS:
+                    vertex_touches.setdefault(vertex, {})[side] = (r, t, direction)
+
+        vertex_hits: list[tuple[float, str, tuple[float, float]]] = []
+        for vertex, arms in vertex_touches.items():
+            # 只有两个邻接段都在轨迹内部触及同一折点才可能归并；只报一侧说明
+            # 另一侧无接触或沿线单点相接，不能构成横穿
+            if set(arms) != {"in", "out"}:
+                continue
+            (r_in, t_in, dir_in), (r_out, t_out, dir_out) = (
+                arms["in"], arms["out"]
+            )
+            # 共线单点相接那侧无法判定方向（None），不能归并
+            if dir_in is None or dir_out is None or dir_in != dir_out:
+                continue  # 方向缺失或两段判断不一致：折点处为混合扇区，歧义排除
+            # 邻接段在折点处占据的是“自折点向外”的射线：进入段射线为 -r_in，
+            # 离开段射线为 r_out。两射线须分居有向轨迹 a->b 两侧
+            # （cross(w, ray) 异号），否则折线在折点处只是切向擦过轨迹线，
+            # 微扰后为 0 个或 2 个交点，不构成横穿
+            wx, wy = vertex[0] - a[0], vertex[1] - a[1]
+            ray_side_in = wx * (-r_in[1]) - wy * (-r_in[0])
+            ray_side_out = wx * r_out[1] - wy * r_out[0]
+            if (
+                ray_side_in == 0.0
+                or ray_side_out == 0.0
+                or ray_side_in * ray_side_out >= 0.0
+            ):
+                continue  # 某侧共线，或两邻接段位于轨迹同侧（擦碰）
+            t = (t_in + t_out) / 2.0
+            vertex_hits.append((t, dir_in, vertex))
+
+        hits = proper_hits + vertex_hits
         if len(hits) != 1:
-            return None
+            return None  # 无交点或多交点歧义
         return hits[0]
 
 
-def _segment_proper_crossing(
+def _segment_intersection(
     p: tuple[float, float],
     q: tuple[float, float],
     a: tuple[float, float],
     b: tuple[float, float],
-) -> tuple[float, str, tuple[float, float]] | None:
-    """两线段的严格内部单点横穿（proper crossing）。
+) -> tuple:
+    """求门线段 p->q 与轨迹线段 a->b 的交点分类。
 
-    门线段 p->q，轨迹线段 a->b。交点必须严格位于两条线段内部
-    （即参数 u、t 都在 (0, 1)），因此共线、接触端点/折点都被排除。
+    返回值之一：
+    - ("none",)：不相交、交点在延长线上、仅在门线段内部单点相接，
+      或轨迹端点落在门线段上；
+    - ("along",)：两线段共线且存在正长度重叠（沿线）；
+    - ("touch", at_q, t, direction)：交于门线段端点（含共线时仅在端点处
+      单点相接），at_q=True 表示交于 q 否则交于 p，t 为交点在轨迹线段
+      a->b 上的参数，direction 为该邻接段按轨迹两端侧别给出的方向判断
+      （共线接触时为 None）；
+    - ("proper", t, direction)：严格内部横穿，t∈(0,1)，direction 为穿越方向。
     """
     rx, ry = q[0] - p[0], q[1] - p[1]
     sx, sy = b[0] - a[0], b[1] - a[1]
     denom = rx * sy - ry * sx
-    if denom == 0.0:
-        return None  # 平行或共线（沿线）
     qpx, qpy = a[0] - p[0], a[1] - p[1]
+    if denom == 0.0:
+        if qpx * ry - qpy * rx != 0.0:
+            return ("none",)  # 平行不共线
+        # 共线：沿门线方向取一维参数 u（p->q 为 u∈[0,1]），求轨迹段的 u 区间
+        r2 = rx * rx + ry * ry
+        if r2 == 0.0:  # 门线已校验无重复点，防御处理
+            return ("none",)
+        u0 = (qpx * rx + qpy * ry) / r2
+        u1 = u0 + (sx * rx + sy * ry) / r2
+        lo, hi = (u0, u1) if u0 <= u1 else (u1, u0)
+        if hi < 0.0 or lo > 1.0:
+            return ("none",)  # 共线但无接触
+        ov_lo, ov_hi = max(lo, 0.0), min(hi, 1.0)
+        if ov_hi > ov_lo:
+            return ("along",)  # 与门线段存在正长度重叠（沿线）
+        if 0.0 < ov_lo < 1.0:
+            return ("none",)  # 仅在门线段内部单点相接，不产生横穿
+        # 仅在门线段端点 u=0/1 处单点相接：按端点接触上报（方向不可判定），
+        # 若它是内部折点，共线这侧因 direction=None 无法与另一侧归并
+        at_q = abs(hi - 1.0) <= _CROSS_EPS or abs(lo - 1.0) <= _CROSS_EPS
+        s2 = sx * sx + sy * sy
+        vx = q[0] if at_q else p[0]
+        vy = q[1] if at_q else p[1]
+        t0 = ((vx - a[0]) * sx + (vy - a[1]) * sy) / s2 if s2 else 0.0
+        return ("touch", at_q, min(max(t0, 0.0), 1.0), None)
+
     u = (qpx * sy - qpy * sx) / denom
     t = (qpx * ry - qpy * rx) / denom
-    if not (_CROSS_EPS < u < 1.0 - _CROSS_EPS and _CROSS_EPS < t < 1.0 - _CROSS_EPS):
-        return None  # 交于端点/延长线（仅接触端点）或不相交
+    if not (-_CROSS_EPS <= u <= 1.0 + _CROSS_EPS and -_CROSS_EPS <= t <= 1.0 + _CROSS_EPS):
+        return ("none",)  # 交点在某条线段的延长线上
 
-    # 两端相对定向门线 p->q 的侧别（标准右手系）：
-    # cross(d, r) > 0 在门线右侧，< 0 在门线左侧。
-    side_a = qpx * ry - qpy * rx          # cross(A - P, r)
-    side_b = (qpx + sx) * ry - (qpy + sy) * rx
-    if side_a * side_b >= 0.0:
-        return None  # 两端同侧（同侧擦碰）或端点恰在门线上
-    point = (a[0] + t * sx, a[1] + t * sy)
+    u_in = _CROSS_EPS < u < 1.0 - _CROSS_EPS
+    t_in = _CROSS_EPS < t < 1.0 - _CROSS_EPS
+    if u_in and t_in:
+        # 两端相对定向门线 p->q 的侧别（标准右手系）：
+        # cross(A-P, r) > 0 在门线右侧，< 0 在门线左侧。
+        side_a = qpx * ry - qpy * rx
+        if side_a == 0.0:
+            return ("none",)  # 理论上 u∈(0,1) 时不会落在门线上，防御处理
+        # 沿门线坐标顺序看：右 -> 左为正向，左 -> 右为反向
+        direction = DIRECTION_FORWARD if side_a > 0 else DIRECTION_REVERSE
+        return ("proper", t, direction)
 
-    # 沿门线坐标顺序看：右 -> 左为正向，左 -> 右为反向
+    if not t_in:
+        return ("none",)  # 轨迹起点/终点在门线上，或交点在轨迹延长线上
+    # u≈0 或 u≈1：交于门线段端点（折点或首尾端点）。交点严格在轨迹内部时
+    # 轨迹两端分居门线支撑线两侧，侧别公式与内部横穿一致
+    at_q = abs(u - 1.0) < _CROSS_EPS
+    side_a = qpx * ry - qpy * rx
     direction = DIRECTION_FORWARD if side_a > 0 else DIRECTION_REVERSE
-    return (t, direction, point)
+    return ("touch", at_q, t, direction)
 
 
 @dataclass
